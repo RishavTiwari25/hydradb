@@ -1900,3 +1900,90 @@ fn may_satisfy_lower_bound(
         value > lower
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slatedb::object_store::memory::InMemory;
+
+    /// `flag` is stored on `a` and `c` only, so `coalesce(n.flag, n.age > 15)`
+    /// is a stored boolean for them and a computed one for `b` and `d`.
+    #[tokio::test]
+    async fn computed_booleans_sort_and_match_like_stored_booleans() {
+        let shard = GraphShard::open_standalone_writer(
+            "graph/experimental-computed-boolean",
+            Arc::new(InMemory::new()),
+        )
+        .await
+        .expect("open graph shard");
+        for (id, name, age, flag) in [
+            (1, "a", 10, Some(false)),
+            (2, "b", 50, None),
+            (3, "c", 20, Some(true)),
+            (4, "d", 5, None),
+        ] {
+            let mut metadata = VertexMetadata::default()
+                .with_label("Entity")
+                .with_property("name", VertexPropertyValue::String(name.to_string()))
+                .with_property("age", VertexPropertyValue::SignedInteger(age));
+            if let Some(flag) = flag {
+                metadata = metadata.with_property("flag", VertexPropertyValue::Bool(flag));
+            }
+            shard
+                .set_vertex_metadata("cell-a", id, metadata)
+                .await
+                .expect("write vertex metadata");
+        }
+        let run = |query: &'static str| {
+            let shard = &shard;
+            async move {
+                shard
+                    .execute_cypher_rows(
+                        QueryContext::new("cell-a", "computed-boolean")
+                            .with_cypher_engine(CypherEngineMode::Experimental)
+                            .with_refreshed_reader(),
+                        query,
+                    )
+                    .await
+                    .expect("execute query")
+                    .rows
+            }
+        };
+        let row = |name: &str, key: bool| {
+            QueryRow::new(vec![
+                QueryValue::Property(VertexPropertyValue::String(name.to_string())),
+                QueryValue::Property(VertexPropertyValue::Bool(key)),
+            ])
+        };
+
+        // false before true, ties by name -- not computed values first.
+        assert_eq!(
+            run("MATCH (n:Entity) \
+                 RETURN n.name AS name, coalesce(n.flag, n.age > 15) AS key \
+                 ORDER BY key, name")
+            .await,
+            vec![
+                row("a", false),
+                row("d", false),
+                row("b", true),
+                row("c", true)
+            ],
+        );
+
+        // `x IN [true]` agrees with `x = true` for a computed boolean.
+        assert_eq!(
+            run(
+                "MATCH (n:Entity) RETURN n.name AS name, (n.age > 15) IN [true] AS key \
+                 ORDER BY name"
+            )
+            .await,
+            vec![
+                row("a", false),
+                row("b", true),
+                row("c", true),
+                row("d", false)
+            ],
+        );
+        shard.close().await.expect("close graph shard");
+    }
+}

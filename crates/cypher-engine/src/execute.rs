@@ -3132,6 +3132,12 @@ fn compare_evaluated_values(left: &EvaluatedValue, right: &EvaluatedValue) -> Or
         ) => Ordering::Equal,
         (EvaluatedValue::Null | EvaluatedValue::Truth(None), _) => Ordering::Greater,
         (_, EvaluatedValue::Null | EvaluatedValue::Truth(None)) => Ordering::Less,
+        // A computed boolean (`n.age > 15`) and a stored one are the same
+        // value, and a result carries both as `Boolean`, so they sort
+        // together rather than each in its own run.
+        (left, right) if boolean_value(left).is_some() && boolean_value(right).is_some() => {
+            boolean_value(left).cmp(&boolean_value(right))
+        }
         (EvaluatedValue::Vertex(left), EvaluatedValue::Vertex(right))
         | (EvaluatedValue::Relationship(left), EvaluatedValue::Relationship(right)) => {
             left.cmp(right)
@@ -3152,12 +3158,21 @@ fn compare_evaluated_values(left: &EvaluatedValue, right: &EvaluatedValue) -> Or
 
 fn evaluated_value_rank(value: &EvaluatedValue) -> u8 {
     match value {
-        EvaluatedValue::Truth(Some(_)) => 1,
+        EvaluatedValue::Truth(Some(value)) => 4 + scalar_value_rank(&ScalarValue::Boolean(*value)),
         EvaluatedValue::Vertex(_) => 2,
         EvaluatedValue::Relationship(_) => 3,
         EvaluatedValue::List(_) => 0,
         EvaluatedValue::Scalar(value) => 4 + scalar_value_rank(value),
         EvaluatedValue::Null | EvaluatedValue::Truth(None) => u8::MAX,
+    }
+}
+
+/// The boolean a value holds, whether computed (`Truth`) or stored.
+fn boolean_value(value: &EvaluatedValue) -> Option<bool> {
+    match value {
+        EvaluatedValue::Truth(Some(value))
+        | EvaluatedValue::Scalar(ScalarValue::Boolean(value)) => Some(*value),
+        _ => None,
     }
 }
 
@@ -4920,6 +4935,12 @@ fn evaluate_in_list(probe: EvaluatedValue, values: &[BoundValue]) -> EvaluatedVa
     if values.is_empty() {
         return EvaluatedValue::Truth(Some(false));
     }
+    // A computed boolean is looked up as the boolean it is, so
+    // `(n.age > 15) IN [true]` matches as `(n.age > 15) = true` does.
+    let probe = match probe {
+        EvaluatedValue::Truth(Some(value)) => EvaluatedValue::Scalar(ScalarValue::Boolean(value)),
+        probe => probe,
+    };
     let EvaluatedValue::Scalar(probe) = probe else {
         return EvaluatedValue::Truth(None);
     };
@@ -5327,4 +5348,91 @@ fn window_count(value: &BoundValue, field: &'static str) -> EngineResult<usize> 
 
 fn unsupported(bucket: QueryFailureReason, reason: impl Into<String>) -> EngineError {
     EngineError::UnsupportedPlan(bucket, reason.into())
+}
+
+#[cfg(test)]
+mod computed_boolean_tests {
+    use super::*;
+
+    fn stored(value: bool) -> EvaluatedValue {
+        EvaluatedValue::Scalar(ScalarValue::Boolean(value))
+    }
+
+    fn computed(value: bool) -> EvaluatedValue {
+        EvaluatedValue::Truth(Some(value))
+    }
+
+    #[test]
+    fn computed_and_stored_booleans_sort_as_one_type() {
+        assert_eq!(
+            compare_evaluated_values(&computed(false), &stored(true)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_evaluated_values(&stored(false), &computed(true)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_evaluated_values(&computed(true), &stored(true)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_evaluated_values(&stored(true), &computed(false)),
+            Ordering::Greater
+        );
+
+        // Sorting a mix of both keeps every false ahead of every true.
+        let mut keys = vec![stored(false), computed(true), stored(true), computed(false)];
+        keys.sort_by(compare_evaluated_values);
+        assert_eq!(
+            keys.iter()
+                .map(|key| boolean_value(key))
+                .collect::<Vec<_>>(),
+            [Some(false), Some(false), Some(true), Some(true)]
+        );
+    }
+
+    #[test]
+    fn computed_booleans_rank_where_stored_booleans_do() {
+        let number = EvaluatedValue::Scalar(ScalarValue::Integer(0));
+        let string = EvaluatedValue::Scalar(ScalarValue::String("a".into()));
+        for value in [computed(true), stored(true)] {
+            assert_eq!(compare_evaluated_values(&value, &number), Ordering::Less);
+            assert_eq!(compare_evaluated_values(&value, &string), Ordering::Less);
+            assert_eq!(
+                compare_evaluated_values(&value, &EvaluatedValue::Null),
+                Ordering::Less
+            );
+        }
+    }
+
+    #[test]
+    fn computed_boolean_probe_matches_in_list() {
+        let list = |values: &[ScalarValue]| {
+            values
+                .iter()
+                .cloned()
+                .map(|value| BoundValue {
+                    value,
+                    origin: crate::ValueOrigin::Literal,
+                })
+                .collect::<Vec<_>>()
+        };
+        let trues = list(&[ScalarValue::Boolean(true)]);
+        let truth = |value: EvaluatedValue| match value {
+            EvaluatedValue::Truth(truth) => truth,
+            other => panic!("IN must answer a truth value, got {other:?}"),
+        };
+        assert_eq!(truth(evaluate_in_list(computed(true), &trues)), Some(true));
+        assert_eq!(
+            truth(evaluate_in_list(computed(false), &trues)),
+            Some(false)
+        );
+        let with_null = list(&[ScalarValue::Boolean(true), ScalarValue::Null]);
+        assert_eq!(truth(evaluate_in_list(computed(false), &with_null)), None);
+        assert_eq!(
+            truth(evaluate_in_list(EvaluatedValue::Truth(None), &trues)),
+            None
+        );
+    }
 }
